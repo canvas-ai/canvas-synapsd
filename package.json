@@ -1,0 +1,17 @@
+{
+  "name": "canvas-synapsdb",
+  "version": "1.0.0",
+  "main": "./src/index.js",
+  "repository": "git@github.com:canvas-ai/canvas-synapsdb.git",
+  "author": "me@idnc.sk",
+  "license": "AGPL-3.0-or-later",
+  "dependencies": {
+    "date-fns": "^4.1.0",
+    "debug": "^4.4.0",
+    "lancedb": "^0.0.1",
+    "lmdb": "^3.2.2",
+    "mime-types": "^2.1.35",
+    "mkdirp": "^3.0.1",
+    "roaring": "^2.4.0"
+  }
+}
