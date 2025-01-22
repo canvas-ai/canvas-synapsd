@@ -2,6 +2,7 @@
   "name": "canvas-synapsdb",
   "version": "1.0.0",
   "main": "./src/index.js",
+  "type": "module",
   "repository": "git@github.com:canvas-ai/canvas-synapsdb.git",
   "author": "me@idnc.sk",
   "license": "AGPL-3.0-or-later",
