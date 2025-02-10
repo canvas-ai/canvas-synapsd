@@ -183,6 +183,9 @@ class BitmapIndex {
             for (const key of positiveKeys) {
                 BitmapIndex._validateKey(key);
                 const bitmap = this.getBitmap(key, true);
+                if (!(bitmap instanceof RoaringBitmap32)) {
+                    throw new TypeError(`Bitmap at key "${key}" is not a RoaringBitmap32 instance`);
+                }
                 // clone the first bitmap so we don't change the original
                 partial = partial.and(bitmap);
             }

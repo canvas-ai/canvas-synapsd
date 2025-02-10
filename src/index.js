@@ -463,7 +463,7 @@ class SynapsD extends EventEmitter {
     // - subtractContextBitmap (subtract the current bitmap from an array of bitmaps)
     // - intersectContextBitmap (intersect the current bitmap with an array of bitmaps)
     // - unionContextBitmap (union the current bitmap with an array of bitmaps)
-    // - xorContextBitmap (xor the current bitmap with an array of bitmaps)
+    // - xorContextBitmap (xor the current bitmap with a array of bitmaps)
     // - invertContextBitmap (invert the current bitmap)
     // - isEmptyContextBitmap (check if the current bitmap is empty)
     // - toArrayContextBitmap (convert the current bitmap to an array of ids)
