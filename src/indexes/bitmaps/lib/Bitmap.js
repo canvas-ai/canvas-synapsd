@@ -29,29 +29,9 @@ class Bitmap extends RoaringBitmap32 {
         this.add(oid);
     }
 
-    tickArray(oidArray) {
-        this.#validateArray(oidArray);
-        this.addMany(oidArray);
-    }
-
-    tickBitmap(bitmap) {
-        this.#validateBitmap(bitmap);
-        this.addMany(bitmap);
-    }
-
     untick(oid) {
         this.#validateOid(oid);
         this.remove(oid);
-    }
-
-    untickArray(oidArray) {
-        this.#validateArray(oidArray);
-        this.removeMany(oidArray);
-    }
-
-    untickBitmap(bitmap) {
-        this.#validateBitmap(bitmap);
-        this.removeMany(bitmap);
     }
 
     static create(oidArrayOrBitmap, options = {}) {
