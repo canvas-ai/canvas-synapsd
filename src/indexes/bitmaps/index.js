@@ -10,7 +10,6 @@ const require = createRequire(import.meta.url);
 // Includes
 const { RoaringBitmap32 } = require('roaring/RoaringBitmap32');
 import Bitmap from './lib/Bitmap.js';
-import BitmapCollection from './lib/BitmapCollection.js';
 
 // Constants
 const ALLOWED_PREFIXES = [

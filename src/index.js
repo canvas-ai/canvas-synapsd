@@ -12,14 +12,7 @@ import Db from './backends/lmdb/index.js';
 import schemaRegistry from './schemas/SchemaRegistry.js';
 import BaseDocument from './schemas/BaseDocument.js';
 // Indexes
-import ChecksumIndex from './indexes/inverted/Checksum.js';
-import TimestampIndex from './indexes/inverted/Timestamp.js';
 import BitmapIndex from './indexes/bitmaps/index.js';
-import VectorIndex from './indexes/vector/index.js';
-
-// Constants
-const INTERNAL_BITMAP_ID_MIN = 0;
-const INTERNAL_BITMAP_ID_MAX = 100000;
 
 /**
  * SynapsD
