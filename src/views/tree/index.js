@@ -910,7 +910,7 @@ class ContextTree extends EventEmitter {
         return this.#db.hasDocumentByChecksum(checksum, normalizedContextSpec, featureBitmapArray);
     }
 
-    async findDocuments(contextSpec = null, featureBitmapArray = [], filterArray = [], options = { limit: null }) {
+    async findDocuments(contextSpec = null, featureBitmapArray = [], filterArray = [], options = { limit: 100, offset: 0 }) {
         const normalizedContextSpec = this.#normalizePath(contextSpec);
         if (!this.#db) { throw new Error('Database instance not passed to ContextTree, functionality not available'); }
         // findDocuments doesn't modify, typically no event needed unless logging access
