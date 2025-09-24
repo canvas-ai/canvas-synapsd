@@ -26,9 +26,8 @@ class Layer {
         this.type = options.type ?? 'context';
         this.name = normalizedName;
 
-        // ID: prefer provided id; otherwise use normalized name (stable, human-readable)
-        // Keep Universe/root special-case IDs passed explicitly
-        this.id = options.id ?? normalizedName ?? uuidv4();
+        // ID: prefer provided id; otherwise generate a UUID (do not derive from name)
+        this.id = options.id ?? uuidv4();
 
         // Label: preserve provided label (original user-facing string), else fallback to original name string
         const providedLabel = options.label ?? String(name ?? normalizedName);
