@@ -73,6 +73,9 @@ class SynapsD extends EventEmitter {
     // LanceDB
     #lanceIndex;
 
+    // Per-document dataset runtime state
+    #datasetStates = new Map();
+
     constructor(options = {
         backupOnOpen: false,
         backupOnClose: true,
@@ -150,6 +153,26 @@ class SynapsD extends EventEmitter {
         // Directory Tree (VFS semantics - unique path bitmaps)
         this.#directoryTree = new DirectoryTree(this.bitmapIndex);
 
+        this.#datasetStates.set('main', {
+            name: 'main',
+            documents: this.documents,
+            metadata: this.metadata,
+            internalStore: this.#internalStore,
+            bitmapCache: this.#bitmapCache,
+            bitmapStore: this.#bitmapStore,
+            bitmapIndex: this.bitmapIndex,
+            contextBitmapCollection: this.contextBitmapCollection,
+            checksumIndex: this.#checksumIndex,
+            timestampIndex: null,
+            synapses: null,
+            lanceIndex: null,
+            tree: this.#tree,
+            directoryTree: this.#directoryTree,
+            actionBitmaps: null,
+            deletedDocumentsBitmap: null,
+            runtimeReady: false,
+        });
+
     }
 
     /**
@@ -201,45 +224,11 @@ class SynapsD extends EventEmitter {
     async start() {
         debug('Starting SynapsD');
         try {
-            // Initialize action bitmaps
-            this.actionBitmaps = {
-                created: await this.bitmapIndex.createBitmap('internal/action/created'),
-                updated: await this.bitmapIndex.createBitmap('internal/action/updated'),
-                deleted: await this.bitmapIndex.createBitmap('internal/action/deleted'),
-            };
-            // Initialize deletedDocumentsBitmap here
-            this.deletedDocumentsBitmap = await this.bitmapIndex.createBitmap('internal/gc/deleted');
-
-            this.#timestampIndex = new TimestampIndex(
-                this.bitmapIndex,
-                this.actionBitmaps,
-            );
-
-            // Initialize Synapses inverted index
-            this.#synapses = new Synapses(
-                this.#db.createDataset('synapses'),
-                this.bitmapIndex
-            );
-
-            // Initialize LanceDB under workspace root (rootPath/lance)
-            this.#lanceIndex = new LanceIndex({
-                rootPath: path.join(this.#rootPath, 'lance'),
-                bitmapIndex: this.bitmapIndex,
-            });
-            await this.#lanceIndex.initialize();
-            await this.#lanceIndex.backfill(this.bitmapIndex, this.documents, parseInitializeDocument, 1000);
-
-            // Initialize context tree
-            await this.#tree.initialize();
-
-            // Migrate bitmap keys from legacy format (one-time, idempotent)
-            await this.#migrateBitmapKeys();
+            const mainDataset = this.#getOrCreateDatasetState('main');
+            await this.#initializeDatasetRuntime(mainDataset, { migrateLegacyBitmaps: true });
 
             // Set status
             this.#status = 'running';
-
-            // TODO: Remove after all instances have been reindexed (added 2026-02-17)
-            await this.reindexFeatures();
 
             this.emit('started');
             debug('SynapsD started');
@@ -344,18 +333,27 @@ class SynapsD extends EventEmitter {
 
         // Support options object: insertDocument(doc, { context, directory, features })
         let directorySpec = null;
+        let dataset = 'main';
         if (typeof contextSpec === 'object' && contextSpec !== null && !Array.isArray(contextSpec)) {
             const opts = contextSpec;
             contextSpec = opts.context ?? '/';
             directorySpec = opts.directory ?? null;
             featureBitmapArray = opts.features ?? featureBitmapArray;
             emitEvent = opts.emitEvent ?? emitEvent;
+            dataset = opts.dataset ?? dataset;
         }
+        dataset = this.#normalizeDatasetName(dataset);
+        const datasetState = await this.#ensureDatasetState(dataset);
 
         // Support inserting by existing document ID to add context/feature memberships
         if (typeof document === 'number' || (typeof document === 'string' && /^\d+$/.test(document))) {
             const docId = typeof document === 'number' ? document : parseInt(document, 10);
-            return await this.updateDocument(docId, null, contextSpec, featureBitmapArray);
+            return await this.updateDocument(docId, null, {
+                context: contextSpec,
+                directory: directorySpec,
+                features: featureBitmapArray,
+                dataset,
+            });
         }
 
         const featureBitmaps = parseBitmapArray(featureBitmapArray);
@@ -364,14 +362,14 @@ class SynapsD extends EventEmitter {
 
         // Dedup by checksum
         const primaryChecksum = parsedDocument.getPrimaryChecksum();
-        const storedDocument = await this.getDocumentByChecksumString(primaryChecksum);
+        const storedDocument = await this.getDocumentByChecksumString(primaryChecksum, { dataset });
 
         if (storedDocument) {
             parsedDocument.id = storedDocument.id;
             if (storedDocument.createdAt) { parsedDocument.createdAt = storedDocument.createdAt; }
             if (storedDocument.updatedAt) { parsedDocument.updatedAt = storedDocument.updatedAt; }
         } else {
-            parsedDocument.id = generateDocumentID(this.#internalStore, INTERNAL_BITMAP_ID_MAX);
+            parsedDocument.id = generateDocumentID(datasetState.internalStore, INTERNAL_BITMAP_ID_MAX);
         }
 
         parsedDocument.validate();
@@ -383,27 +381,28 @@ class SynapsD extends EventEmitter {
 
         try {
             await this.#db.transaction(async () => {
-                await this.documents.put(parsedDocument.id, parsedDocument);
-                await this.#checksumIndex.insertArray(parsedDocument.checksumArray, parsedDocument.id);
-                await this.#timestampIndex.insert('created', parsedDocument.createdAt || new Date().toISOString(), parsedDocument.id);
-                await this.#timestampIndex.insert('updated', parsedDocument.updatedAt, parsedDocument.id);
-                await this.#indexDocument(parsedDocument.id, contextSpec, directorySpec, featureBitmaps);
+                await datasetState.documents.put(parsedDocument.id, parsedDocument);
+                await datasetState.checksumIndex.insertArray(parsedDocument.checksumArray, parsedDocument.id);
+                await datasetState.timestampIndex.insert('created', parsedDocument.createdAt || new Date().toISOString(), parsedDocument.id);
+                await datasetState.timestampIndex.insert('updated', parsedDocument.updatedAt, parsedDocument.id);
+                await this.#indexDocument(datasetState, parsedDocument.id, contextSpec, directorySpec, featureBitmaps);
             });
         } catch (error) {
             throw new Error('Error inserting document atomically: ' + error.message);
         }
 
         // Best-effort Lance upsert
-        try { await this.#lanceIndex.upsert(parseInitializeDocument(parsedDocument)); } catch (_) { }
+        try { await datasetState.lanceIndex.upsert(parseInitializeDocument(parsedDocument)); } catch (_) { }
 
         if (emitEvent) {
-            this.tree.emit('tree.document.inserted', {
+            datasetState.tree.emit('tree.document.inserted', {
                 documentId: parsedDocument.id,
                 contextSpec,
                 directorySpec,
+                dataset,
                 timestamp: new Date().toISOString(),
             });
-            this.emit('document.inserted', { id: parsedDocument.id, document: parsedDocument });
+            this.emit('document.inserted', { id: parsedDocument.id, document: parsedDocument, dataset });
         }
 
         return parsedDocument.id;
@@ -416,7 +415,15 @@ class SynapsD extends EventEmitter {
         if (!Array.isArray(featureBitmapArray)) {
             throw new Error('Feature array must be an array');
         }
-        debug(`insertDocumentArray: Attempting to insert ${docArray.length} documents with contextSpec: ${contextSpec} and featureBitmapArray: ${featureBitmapArray}`);
+        let dataset = 'main';
+        if (typeof contextSpec === 'object' && contextSpec !== null && !Array.isArray(contextSpec)) {
+            const opts = contextSpec;
+            contextSpec = opts.context ?? '/';
+            featureBitmapArray = opts.features ?? featureBitmapArray;
+            dataset = opts.dataset ?? dataset;
+        }
+        dataset = this.#normalizeDatasetName(dataset);
+        debug(`insertDocumentArray: Attempting to insert ${docArray.length} documents with contextSpec: ${contextSpec}, dataset: ${dataset} and featureBitmapArray: ${featureBitmapArray}`);
 
         const insertedIds = [];
         // TODO: Implement actual batch/transactional operation in the backend if possible
@@ -424,7 +431,12 @@ class SynapsD extends EventEmitter {
             const doc = docArray[i];
             try {
                 // Pass emitEvent = false to prevent multiple events
-                const id = await this.insertDocument(doc, contextSpec, featureBitmapArray, false);
+                const id = await this.insertDocument(doc, {
+                    context: contextSpec,
+                    features: featureBitmapArray,
+                    dataset,
+                    emitEvent: false,
+                });
                 insertedIds.push(id);
                 debug(`insertDocumentArray: Successfully inserted document at index ${i}, ID: ${id}`);
             } catch (error) {
@@ -443,13 +455,15 @@ class SynapsD extends EventEmitter {
         debug(`insertDocumentArray: Successfully inserted all ${insertedIds.length} documents.`);
 
         // Emit tree event for batch insertion with contextSpec for workspace mode auto-opening support
-        if (insertedIds.length > 0 && this.tree) {
+        const datasetState = await this.#ensureDatasetState(dataset);
+        if (insertedIds.length > 0 && datasetState.tree) {
             try {
-                debug(`insertDocumentArray: Emitting tree batch event for ${insertedIds.length} documents at contextSpec: ${contextSpec}`);
+                debug(`insertDocumentArray: Emitting tree batch event for ${insertedIds.length} documents at contextSpec: ${contextSpec} in dataset: ${dataset}`);
 
-                this.tree.emit('tree.document.inserted.batch', {
+                datasetState.tree.emit('tree.document.inserted.batch', {
                     documentIds: insertedIds,
                     contextSpec: contextSpec,
+                    dataset,
                     layerNames: [], // Simple implementation for now - layerNames is not critical for tab auto-opening
                     timestamp: new Date().toISOString(),
                 });
@@ -468,9 +482,18 @@ class SynapsD extends EventEmitter {
 
     async hasDocument(id, contextSpec = '/', featureBitmapArrayInput) {
         if (!id) { throw new Error('Document id required'); }
+        let dataset = 'main';
+        if (typeof contextSpec === 'object' && contextSpec !== null && !Array.isArray(contextSpec)) {
+            const opts = contextSpec;
+            contextSpec = opts.context ?? '/';
+            featureBitmapArrayInput = opts.features ?? featureBitmapArrayInput;
+            dataset = opts.dataset ?? dataset;
+        }
+        dataset = this.#normalizeDatasetName(dataset);
+        const datasetState = await this.#ensureDatasetState(dataset);
 
-        if (!await this.documents.has(id)) {
-            debug(`hasDocument: Document with ID "${id}" not found in the main 'documents' store.`);
+        if (!await datasetState.documents.has(id)) {
+            debug(`hasDocument: Document with ID "${id}" not found in dataset "${dataset}".`);
             return false;
         }
 
@@ -491,7 +514,7 @@ class SynapsD extends EventEmitter {
         const parsedContextKeys = parseContextSpecForQuery(effectiveContextSpec);
         const hasExplicitRootContext = effectiveContextSpec === '/';
         const hasExplicitContextPath = !hasExplicitRootContext && !noContextFilterWanted;
-        if (hasExplicitContextPath && !this.tree.getLayerForPath(effectiveContextSpec)) {
+        if (hasExplicitContextPath && !datasetState.tree.getLayerForPath(effectiveContextSpec)) {
             debug(`hasDocument: Doc ${id} - explicit context path "${effectiveContextSpec}" does not exist.`);
             return false;
         }
@@ -503,11 +526,11 @@ class SynapsD extends EventEmitter {
         // Apply context filter if caller actually wanted one OR if it defaulted to '/' but features are also specified.
         if (!noContextFilterWanted || (noContextFilterWanted && !noFeatureFilterWanted)) {
             // Resolve context layer names to ULIDs (root '/' is skipped, yielding [] for root-only queries)
-            const contextLayerIds = this.tree.resolveLayerIds(parsedContextKeys);
+            const contextLayerIds = datasetState.tree.resolveLayerIds(parsedContextKeys);
             if (contextLayerIds.length === 0) {
                 // Root-only context — no bitmap filter to apply
             } else {
-                resultBitmap = await this.contextBitmapCollection.AND(contextLayerIds);
+                resultBitmap = await datasetState.contextBitmapCollection.AND(contextLayerIds);
                 contextFilterApplied = true;
             }
             // If context filter results in null/empty, and it was a specific request, then fail early.
@@ -520,7 +543,7 @@ class SynapsD extends EventEmitter {
         }
 
         if (!noFeatureFilterWanted && parsedFeatureKeys.length > 0) {
-            const featureOpBitmap = await this.#buildFeatureBitmap(parsedFeatureKeys);
+            const featureOpBitmap = await this.#buildFeatureBitmap(datasetState, parsedFeatureKeys);
             if (!featureOpBitmap || featureOpBitmap.isEmpty) {
                 debug(`hasDocument: Doc ${id} - explicit feature filter ${JSON.stringify(parsedFeatureKeys)} yielded no results.`);
                 return false; // Feature filter must yield results if specified
@@ -553,15 +576,22 @@ class SynapsD extends EventEmitter {
 
     async getBitmapsForDocument(id, prefix = '') {
         if (!id) throw new Error('Document ID required');
+        let dataset = 'main';
+        if (typeof prefix === 'object' && prefix !== null && !Array.isArray(prefix)) {
+            dataset = prefix.dataset ?? dataset;
+            prefix = prefix.prefix ?? '';
+        }
+        dataset = this.#normalizeDatasetName(dataset);
+        const datasetState = await this.#ensureDatasetState(dataset);
 
-        const keys = await this.bitmapIndex.listBitmaps(prefix);
+        const keys = await datasetState.bitmapIndex.listBitmaps(prefix);
         const matchingKeys = [];
 
         for (const key of keys) {
             // We need to check if the ID exists in this bitmap
             // Optimization: check cache first? listBitmaps returns keys.
             // We have to load the bitmap to check.
-            const bitmap = await this.bitmapIndex.getBitmap(key, false);
+            const bitmap = await datasetState.bitmapIndex.getBitmap(key, false);
             if (bitmap && bitmap.has(id)) {
                 matchingKeys.push(key);
             }
@@ -571,11 +601,20 @@ class SynapsD extends EventEmitter {
 
     async hasDocumentByChecksum(checksum, contextSpec = '/', featureBitmapArray) {
         if (!checksum) { throw new Error('Checksum required'); }
+        let dataset = 'main';
+        if (typeof contextSpec === 'object' && contextSpec !== null && !Array.isArray(contextSpec)) {
+            const opts = contextSpec;
+            contextSpec = opts.context ?? '/';
+            featureBitmapArray = opts.features ?? featureBitmapArray;
+            dataset = opts.dataset ?? dataset;
+        }
+        dataset = this.#normalizeDatasetName(dataset);
+        const datasetState = await this.#ensureDatasetState(dataset);
 
-        const id = await this.#checksumIndex.checksumStringToId(checksum);
+        const id = await datasetState.checksumIndex.checksumStringToId(checksum);
         if (!id) { return false; }
 
-        return await this.hasDocument(id, contextSpec, featureBitmapArray);
+        return await this.hasDocument(id, { context: contextSpec, features: featureBitmapArray, dataset });
     }
 
     async find(spec = {}) {
@@ -584,7 +623,9 @@ class SynapsD extends EventEmitter {
             attributes,
             filterArray,
             options,
+            dataset,
         } = this.#normalizeFindSpec(spec);
+        const datasetState = await this.#ensureDatasetState(dataset);
 
         // Normalize options and pagination defaults
         const effectiveOptions = typeof options === 'object' && options !== null ? { ...options } : { parse: true };
@@ -610,7 +651,7 @@ class SynapsD extends EventEmitter {
             let filtersApplied = false;
 
             // Apply context filters only if contextSpec was explicitly provided
-            if (hasExplicitContextPath && !this.tree.getLayerForPath(contextSpec)) {
+            if (hasExplicitContextPath && !datasetState.tree.getLayerForPath(contextSpec)) {
                 const emptyArray = [];
                 emptyArray.count = 0;
                 emptyArray.totalCount = 0;
@@ -619,15 +660,15 @@ class SynapsD extends EventEmitter {
             }
 
             if (contextSpec !== null && contextSpec !== undefined && contextBitmapArray.length > 0) {
-                const contextLayerIds = this.tree.resolveLayerIds(contextBitmapArray);
+                const contextLayerIds = datasetState.tree.resolveLayerIds(contextBitmapArray);
                 if (contextLayerIds.length > 0) {
-                    resultBitmap = await this.contextBitmapCollection.AND(contextLayerIds);
+                    resultBitmap = await datasetState.contextBitmapCollection.AND(contextLayerIds);
                     filtersApplied = true;
                 }
             }
 
             // Apply bitmap-backed attribute filters if provided
-            const attributeBitmap = await this.#buildAttributesBitmap(attributes);
+            const attributeBitmap = await this.#buildAttributesBitmap(datasetState, attributes);
             if (attributeBitmap) {
                 if (filtersApplied && resultBitmap) {
                     resultBitmap.andInPlace(attributeBitmap);
@@ -643,7 +684,7 @@ class SynapsD extends EventEmitter {
 
                 // Apply bitmap filters
                 if (bitmapFilters.length > 0) {
-                    const filterBitmap = await this.bitmapIndex.AND(bitmapFilters);
+                    const filterBitmap = await datasetState.bitmapIndex.AND(bitmapFilters);
                     if (filtersApplied) {
                         resultBitmap.andInPlace(filterBitmap);
                     } else {
@@ -654,7 +695,7 @@ class SynapsD extends EventEmitter {
 
                 // Apply datetime filters
                 for (const datetimeFilter of datetimeFilters) {
-                    const datetimeBitmap = await applyDatetimeFilter(datetimeFilter, this.#timestampIndex);
+                    const datetimeBitmap = await applyDatetimeFilter(datetimeFilter, datasetState.timestampIndex);
                     if (datetimeBitmap) {
                         if (filtersApplied) {
                             resultBitmap.andInPlace(datetimeBitmap);
@@ -671,12 +712,12 @@ class SynapsD extends EventEmitter {
 
             // Case 1: No filters were effectively applied
             if (!filtersApplied) {
-                const totalCount = await this.documents.getCount();
+                const totalCount = await datasetState.documents.getCount();
 
                 // Iterate and collect the requested page window (or all documents if no limit)
                 const pagedDocs = [];
                 let seen = 0;
-                for await (const { value } of this.documents.getRange()) {
+                for await (const { value } of datasetState.documents.getRange()) {
                     if (seen++ < offset) { continue; }
                     pagedDocs.push(value);
                     if (limit > 0 && pagedDocs.length >= limit) { break; }
@@ -710,7 +751,7 @@ class SynapsD extends EventEmitter {
             const slicedIds = limit === 0 ? finalDocumentIds : finalDocumentIds.slice(offset, offset + limit);
 
             // Get documents from database for the page
-            const documents = await this.documents.getMany(slicedIds);
+            const documents = await datasetState.documents.getMany(slicedIds);
             const resultArray = parseDocuments ? this.#safeParseDocuments(documents) : documents;
             // Attach metadata for compatibility
             resultArray.count = resultArray.length; // Number of documents actually returned (after filtering corrupted)
@@ -744,17 +785,21 @@ class SynapsD extends EventEmitter {
 
         // Support options object
         let directorySpec = null;
+        let dataset = 'main';
         if (typeof contextSpec === 'object' && contextSpec !== null && !Array.isArray(contextSpec)) {
             const opts = contextSpec;
             contextSpec = opts.context ?? null;
             directorySpec = opts.directory ?? null;
             featureBitmapArray = opts.features ?? featureBitmapArray;
+            dataset = opts.dataset ?? dataset;
         }
+        dataset = this.#normalizeDatasetName(dataset);
+        const datasetState = await this.#ensureDatasetState(dataset);
 
         const docId = docIdentifier;
         const featureBitmaps = parseBitmapArray(featureBitmapArray);
 
-        const storedDocument = await this.getDocumentById(docId);
+        const storedDocument = await this.getDocumentById(docId, { dataset });
         if (!storedDocument) { throw new Error(`Document with ID "${docId}" not found`); }
 
         // If no update data provided, we're only updating memberships
@@ -775,19 +820,19 @@ class SynapsD extends EventEmitter {
         }
 
         try {
-            await this.documents.put(updatedDocument.id, updatedDocument);
-            await this.#checksumIndex.deleteArray(storedDocument.checksumArray);
-            await this.#checksumIndex.insertArray(updatedDocument.checksumArray, updatedDocument.id);
-            await this.#timestampIndex.insert('updated', updatedDocument.updatedAt, updatedDocument.id);
+            await datasetState.documents.put(updatedDocument.id, updatedDocument);
+            await datasetState.checksumIndex.deleteArray(storedDocument.checksumArray);
+            await datasetState.checksumIndex.insertArray(updatedDocument.checksumArray, updatedDocument.id);
+            await datasetState.timestampIndex.insert('updated', updatedDocument.updatedAt, updatedDocument.id);
 
             // Index across all views using shared helper
-            await this.#indexDocument(updatedDocument.id, contextSpec, directorySpec, featureBitmaps);
+            await this.#indexDocument(datasetState, updatedDocument.id, contextSpec, directorySpec, featureBitmaps);
 
-            this.emit('document.updated', { id: updatedDocument.id, document: updatedDocument });
+            this.emit('document.updated', { id: updatedDocument.id, document: updatedDocument, dataset });
 
             // Best-effort Lance upsert
             try {
-                await this.#lanceIndex.upsert(parseInitializeDocument(updatedDocument));
+                await datasetState.lanceIndex.upsert(parseInitializeDocument(updatedDocument));
             } catch (e) {
                 debug(`updateDocument: Lance upsert failed for ${updatedDocument.id}: ${e.message}`);
             }
@@ -806,7 +851,15 @@ class SynapsD extends EventEmitter {
         if (!Array.isArray(featureBitmapArray)) {
             throw new Error('Feature array must be an array');
         }
-        debug(`updateDocumentArray: Attempting to update ${docArray.length} documents`);
+        let dataset = 'main';
+        if (typeof contextSpec === 'object' && contextSpec !== null && !Array.isArray(contextSpec)) {
+            const opts = contextSpec;
+            contextSpec = opts.context ?? null;
+            featureBitmapArray = opts.features ?? featureBitmapArray;
+            dataset = opts.dataset ?? dataset;
+        }
+        dataset = this.#normalizeDatasetName(dataset);
+        debug(`updateDocumentArray: Attempting to update ${docArray.length} documents in dataset: ${dataset}`);
 
         const updatedIds = [];
         // TODO: Implement actual batch/transactional operation
@@ -822,7 +875,11 @@ class SynapsD extends EventEmitter {
             try {
                 // Assuming updateDocument returns the ID and handles its own event emission logic for individual updates
                 // For batch, we might want to suppress individual events and emit one batch event
-                const id = await this.updateDocument(docUpdate.id, docUpdate.data, contextSpec, featureBitmapArray);
+                const id = await this.updateDocument(docUpdate.id, docUpdate.data, {
+                    context: contextSpec,
+                    features: featureBitmapArray,
+                    dataset,
+                });
                 updatedIds.push(id);
                 debug(`updateDocumentArray: Successfully updated document at index ${i}, ID: ${id}`);
             } catch (error) {
@@ -846,6 +903,16 @@ class SynapsD extends EventEmitter {
         if (!docId) { throw new Error('Document id required'); }
         if (!Array.isArray(featureBitmapArray)) { throw new Error('Feature array must be an array'); }
         if (typeof options !== 'object') { options = { recursive: false }; }
+        let dataset = options.dataset ?? 'main';
+        if (typeof contextSpec === 'object' && contextSpec !== null && !Array.isArray(contextSpec)) {
+            const opts = contextSpec;
+            contextSpec = opts.context ?? '/';
+            featureBitmapArray = opts.features ?? featureBitmapArray;
+            options = { ...options, recursive: opts.recursive ?? options.recursive };
+            dataset = opts.dataset ?? dataset;
+        }
+        dataset = this.#normalizeDatasetName(dataset);
+        const datasetState = await this.#ensureDatasetState(dataset);
 
         // Parse context into array of independent path-layer-arrays
         const pathLayersArray = parseContextSpecForInsert(contextSpec);
@@ -890,8 +957,8 @@ class SynapsD extends EventEmitter {
 
             if (allLayersToRemove.length > 0) {
                 // Resolve layer names to ULIDs for bitmap keying
-                const layerIds = this.tree.resolveLayerIds(allLayersToRemove);
-                const normalizedContexts = layerIds.map(l => this.contextBitmapCollection.makeKey(l));
+                const layerIds = datasetState.tree.resolveLayerIds(allLayersToRemove);
+                const normalizedContexts = layerIds.map(l => datasetState.contextBitmapCollection.makeKey(l));
                 layersToRemove.push(...normalizedContexts);
             }
             if (featureBitmapArray.length > 0) {
@@ -899,13 +966,13 @@ class SynapsD extends EventEmitter {
             }
 
             if (layersToRemove.length > 0) {
-                await this.#synapses.removeSynapses(docId, layersToRemove);
+                await datasetState.synapses.removeSynapses(docId, layersToRemove);
                 debug(`removeDocument: Removed doc ${docId} from ${layersToRemove.length} layers via Synapses`);
             }
 
             // If the operations completed without throwing, return the ID.
             // This signals the removal *attempt* was successful.
-            this.emit('document.removed', { id: docId, contextArray: allLayersToRemove, featureArray: featureBitmapArray, recursive: options.recursive });
+            this.emit('document.removed', { id: docId, contextArray: allLayersToRemove, featureArray: featureBitmapArray, recursive: options.recursive, dataset });
             return docId;
 
         } catch (error) {
@@ -924,7 +991,16 @@ class SynapsD extends EventEmitter {
             throw new Error('Feature array must be an array');
         }
         if (typeof options !== 'object') { options = { recursive: false }; }
-        debug(`removeDocumentArray: Attempting to remove ${docIdArray.length} documents from context/features (recursive: ${options.recursive})`);
+        let dataset = options.dataset ?? 'main';
+        if (typeof contextSpec === 'object' && contextSpec !== null && !Array.isArray(contextSpec)) {
+            const opts = contextSpec;
+            contextSpec = opts.context ?? '/';
+            featureBitmapArray = opts.features ?? featureBitmapArray;
+            options = { ...options, recursive: opts.recursive ?? options.recursive };
+            dataset = opts.dataset ?? dataset;
+        }
+        dataset = this.#normalizeDatasetName(dataset);
+        debug(`removeDocumentArray: Attempting to remove ${docIdArray.length} documents from context/features (recursive: ${options.recursive}) in dataset: ${dataset}`);
 
         const result = {
             successful: [], // Array of { index: number, id: number }
@@ -945,7 +1021,12 @@ class SynapsD extends EventEmitter {
             }
             try {
                 // removeDocument returns the ID on success, throws on failure
-                const removedId = await this.removeDocument(id, contextSpec, featureBitmapArray, options);
+                const removedId = await this.removeDocument(id, {
+                    context: contextSpec,
+                    features: featureBitmapArray,
+                    recursive: options.recursive,
+                    dataset,
+                });
                 result.successful.push({ index: i, id: removedId });
                 debug(`removeDocumentArray: Successfully removed document ID ${id} (index ${i}) from context/features.`);
             } catch (error) {
@@ -968,6 +1049,8 @@ class SynapsD extends EventEmitter {
     async deleteDocument(docId, options = {}) {
         if (!docId) { throw new Error('Document id required'); }
         const { emitEvent = true } = options;
+        const dataset = this.#normalizeDatasetName(options.dataset);
+        const datasetState = await this.#ensureDatasetState(dataset);
         debug(`deleteDocument: Document with ID "${docId}" found (or context check passed), proceeding to delete..`);
 
         let document = null;
@@ -975,7 +1058,7 @@ class SynapsD extends EventEmitter {
 
         try {
             // Get document before deletion (outside transaction to check existence)
-            const documentData = await this.documents.get(docId);
+            const documentData = await datasetState.documents.get(docId);
             if (!documentData) {
                 debug(`deleteDocument: Document with ID "${docId}" not found`);
                 return false;
@@ -986,28 +1069,28 @@ class SynapsD extends EventEmitter {
             // Wrap all critical database operations in a single transaction for atomicity
             await this.#db.transaction(async () => {
                 // Delete document from main database
-                await this.documents.delete(docId);
+                await datasetState.documents.delete(docId);
                 debug(`deleteDocument: Document ${docId} deleted from main store`);
 
                 // Delete document from all bitmaps AND Reverse Index via Synapses
                 // await this.bitmapIndex.untickAll(docId);
-                await this.#synapses.clearSynapses(docId);
+                await datasetState.synapses.clearSynapses(docId);
                 debug(`deleteDocument: Document ${docId} removed from all bitmaps and Synapses index`);
 
                 // Remove document from timestamp indices (created, updated)
-                await this.#timestampIndex.remove(null, docId);
+                await datasetState.timestampIndex.remove(null, docId);
                 debug(`deleteDocument: Document ${docId} removed from timestamp indices`);
 
                 // Delete document checksums from inverted index
-                await this.#checksumIndex.deleteArray(document.checksumArray);
+                await datasetState.checksumIndex.deleteArray(document.checksumArray);
                 debug(`deleteDocument: Checksums for document ${docId} deleted from index`);
 
                 // Add document ID to deleted documents bitmap
-                await this.deletedDocumentsBitmap.tick(docId);
+                await datasetState.deletedDocumentsBitmap.tick(docId);
                 debug(`deleteDocument: Document ${docId} added to deleted documents bitmap`);
 
                 // Update timestamp index
-                await this.#timestampIndex.insert('deleted', document.updatedAt || new Date().toISOString(), docId);
+                await datasetState.timestampIndex.insert('deleted', document.updatedAt || new Date().toISOString(), docId);
                 debug(`deleteDocument: Timestamp for document ${docId} updated in index`);
             });
 
@@ -1024,7 +1107,7 @@ class SynapsD extends EventEmitter {
         // Best-effort Lance delete (outside transaction since it's a separate system)
         if (transactionSuccess) {
             try {
-                await this.#lanceIndex.delete(docId);
+                await datasetState.lanceIndex.delete(docId);
                 debug(`deleteDocument: LanceDB cleanup completed for document ${docId}`);
             } catch (e) {
                 debug(`deleteDocument: Lance delete failed for ${docId}: ${e.message}`);
@@ -1032,7 +1115,7 @@ class SynapsD extends EventEmitter {
             }
 
             if (emitEvent) {
-                this.emit('document.deleted', { id: docId });
+                this.emit('document.deleted', { id: docId, dataset });
             }
             debug(`deleteDocument: Successfully deleted document ID: ${docId}`);
             return true;
@@ -1104,10 +1187,15 @@ class SynapsD extends EventEmitter {
 
     async getDocument(docId, contextSpec = '/', options = { parse: true }) {
         if (!docId) { throw new Error('Document id required'); }
+        if (typeof contextSpec === 'object' && contextSpec !== null && !Array.isArray(contextSpec)) {
+            options = contextSpec;
+            contextSpec = '/';
+        }
+        const datasetState = await this.#ensureDatasetState(options?.dataset);
         if (options.parse) {
-            return await this.getDocumentById(docId);
+            return await this.getDocumentById(docId, options);
         } else {
-            return await this.documents.get(docId, contextSpec, options);
+            return await datasetState.documents.get(docId, contextSpec, options);
         }
     }
 
@@ -1122,9 +1210,10 @@ class SynapsD extends EventEmitter {
         if (!id) { throw new Error('Document id required'); }
         if (typeof id === 'string') { id = parseInt(id); }
         debug(`getById: Searching for document with ID ${id} of type ${typeof id}`);
+        const datasetState = await this.#ensureDatasetState(options?.dataset);
 
         // Get raw document data from database
-        const rawDocData = await this.documents.get(id);
+        const rawDocData = await datasetState.documents.get(id);
         if (!rawDocData) {
             debug(`Document with ID ${id} not found`);
             return null;
@@ -1147,6 +1236,7 @@ class SynapsD extends EventEmitter {
         if (!Array.isArray(idArray)) {
             throw new Error('Document ID array must be an array');
         }
+        const datasetState = await this.#ensureDatasetState(options?.dataset);
 
         // Convert all ids to numbers if they are strings
         const processedIdArray = idArray.map(id => typeof id === 'string' ? parseInt(id) : id);
@@ -1162,7 +1252,7 @@ class SynapsD extends EventEmitter {
 
         debug(`getDocumentsByIdArray: Getting ${processedIdArray.length} documents from DB.`);
         try {
-            const documents = await this.documents.getMany(processedIdArray);
+            const documents = await datasetState.documents.getMany(processedIdArray);
             // The `count` should reflect how many documents were found that matched the criteria (including context)
             // If limit is applied, count still refers to total potential matches, not just the returned slice.
             const totalMatchingCount = documents.length;
@@ -1192,9 +1282,10 @@ class SynapsD extends EventEmitter {
     async getDocumentByChecksumString(checksumString, options = { parse: true }) {
         if (!checksumString) { throw new Error('Checksum string required'); }
         debug(`getDocumentByChecksumString: Searching for document with checksum ${checksumString}`);
+        const datasetState = await this.#ensureDatasetState(options?.dataset);
 
         // Get document ID from checksum index
-        const id = await this.#checksumIndex.checksumStringToId(checksumString);
+        const id = await datasetState.checksumIndex.checksumStringToId(checksumString);
         if (!id) { return null; }
 
         // Return the document instance, passing the contextSpec through
@@ -1214,9 +1305,10 @@ class SynapsD extends EventEmitter {
 
         try {
             const ids = [];
+            const datasetState = await this.#ensureDatasetState(options?.dataset);
             for (const checksum of checksumStringArray) {
                 try {
-                    const id = await this.#checksumIndex.checksumStringToId(checksum);
+                    const id = await datasetState.checksumIndex.checksumStringToId(checksum);
                     if (id) {
                         ids.push(id);
                     }
@@ -1340,7 +1432,11 @@ class SynapsD extends EventEmitter {
     }
 
     async ftsQuery(queryString, contextSpec = null, featureBitmapArray = [], filterArray = [], options = { parse: true, limit: 50, offset: 0 }) {
-        if (!this.#lanceIndex || !this.#lanceIndex.isReady) {
+        const effectiveOptions = typeof options === 'object' && options !== null ? { ...options } : { parse: true };
+        const dataset = this.#normalizeDatasetName(effectiveOptions.dataset);
+        delete effectiveOptions.dataset;
+        const datasetState = await this.#ensureDatasetState(dataset);
+        if (!datasetState.lanceIndex || !datasetState.lanceIndex.isReady) {
             const empty = [];
             empty.count = 0;
             empty.totalCount = 0;
@@ -1349,7 +1445,6 @@ class SynapsD extends EventEmitter {
         }
 
         // Normalize options
-        const effectiveOptions = typeof options === 'object' && options !== null ? { ...options } : { parse: true };
         const limit = Number.isFinite(effectiveOptions.limit) ? Math.max(0, Number(effectiveOptions.limit)) : 50;
         const offset = Math.max(0, Number.isFinite(effectiveOptions.offset) ? Number(effectiveOptions.offset) : 0);
 
@@ -1359,7 +1454,7 @@ class SynapsD extends EventEmitter {
         const contextBitmapArray = parseContextSpecForQuery(contextSpec);
         const hasExplicitContextPath = contextSpec !== null && contextSpec !== undefined && contextSpec !== '/';
 
-        if (hasExplicitContextPath && !this.tree.getLayerForPath(contextSpec)) {
+        if (hasExplicitContextPath && !datasetState.tree.getLayerForPath(contextSpec)) {
             const empty = [];
             empty.count = 0;
             empty.totalCount = 0;
@@ -1368,9 +1463,9 @@ class SynapsD extends EventEmitter {
         }
 
         if (contextBitmapArray.length > 0) {
-            const contextLayerIds = this.tree.resolveLayerIds(contextBitmapArray);
+            const contextLayerIds = datasetState.tree.resolveLayerIds(contextBitmapArray);
             if (contextLayerIds.length > 0) {
-                candidateBitmap = await this.contextBitmapCollection.AND(contextLayerIds);
+                candidateBitmap = await datasetState.contextBitmapCollection.AND(contextLayerIds);
                 filtersApplied = true;
             }
         }
@@ -1381,7 +1476,7 @@ class SynapsD extends EventEmitter {
             filterArray = [filterArray];
         }
         if (Array.isArray(featureBitmapArray) && featureBitmapArray.length > 0) {
-            const featureBitmap = await this.#buildFeatureBitmap(featureBitmapArray);
+            const featureBitmap = await this.#buildFeatureBitmap(datasetState, featureBitmapArray);
             if (filtersApplied && candidateBitmap) { candidateBitmap.andInPlace(featureBitmap); } else { candidateBitmap = featureBitmap; filtersApplied = true; }
         }
 
@@ -1391,13 +1486,13 @@ class SynapsD extends EventEmitter {
 
             // Apply bitmap filters
             if (bitmapFilters.length > 0) {
-                const extraFilter = await this.bitmapIndex.AND(bitmapFilters);
+                const extraFilter = await datasetState.bitmapIndex.AND(bitmapFilters);
                 if (filtersApplied && candidateBitmap) { candidateBitmap.andInPlace(extraFilter); } else { candidateBitmap = extraFilter; filtersApplied = true; }
             }
 
             // Apply datetime filters
             for (const datetimeFilter of datetimeFilters) {
-                const datetimeBitmap = await applyDatetimeFilter(datetimeFilter, this.#timestampIndex);
+                const datetimeBitmap = await applyDatetimeFilter(datetimeFilter, datasetState.timestampIndex);
                 if (datetimeBitmap) {
                     if (filtersApplied && candidateBitmap) {
                         candidateBitmap.andInPlace(datetimeBitmap);
@@ -1419,17 +1514,17 @@ class SynapsD extends EventEmitter {
         }
         // Use local FTS scoring over candidate IDs for deterministic results
         if (filtersApplied && candidateIds.length > 0) {
-            const docs = await this.documents.getMany(candidateIds);
+            const docs = await datasetState.documents.getMany(candidateIds);
             const parsedDocs = this.#safeParseDocuments(docs);
-            return await this.#lanceIndex.ftsQuery(queryString, candidateIds, parsedDocs, { limit, offset });
+            return await datasetState.lanceIndex.ftsQuery(queryString, candidateIds, parsedDocs, { limit, offset });
         }
 
         const docs = [];
-        for await (const { value } of this.documents.getRange()) {
+        for await (const { value } of datasetState.documents.getRange()) {
             docs.push(value);
         }
         const parsedDocs = this.#safeParseDocuments(docs);
-        return await this.#lanceIndex.ftsQuery(queryString, [], parsedDocs, { limit, offset });
+        return await datasetState.lanceIndex.ftsQuery(queryString, [], parsedDocs, { limit, offset });
     }
 
     /**
@@ -1538,7 +1633,7 @@ class SynapsD extends EventEmitter {
      * Shared bitmap indexing for both insert and update operations.
      * Handles: context tree bitmaps, directory tree bitmaps, feature bitmaps, synapses.
      */
-    async #indexDocument(docId, contextSpec, directorySpec, featureBitmaps) {
+    async #indexDocument(datasetState, docId, contextSpec, directorySpec, featureBitmaps) {
         const allSynapseKeys = [];
 
         // Context tree: resolve layer names to ULIDs and tick bitmaps
@@ -1546,12 +1641,12 @@ class SynapsD extends EventEmitter {
             const pathLayersArray = parseContextSpecForInsert(contextSpec);
             for (const pathLayers of pathLayersArray) {
                 const pathString = pathLayers.join('/');
-                await this.tree.insertPath(pathString);
+                await datasetState.tree.insertPath(pathString);
 
-                const layerIds = this.tree.resolveLayerIds(pathLayers);
-                await this.contextBitmapCollection.tickMany(layerIds, docId);
+                const layerIds = datasetState.tree.resolveLayerIds(pathLayers);
+                await datasetState.contextBitmapCollection.tickMany(layerIds, docId);
 
-                const normalizedLayers = layerIds.map(l => this.contextBitmapCollection.makeKey(l));
+                const normalizedLayers = layerIds.map(l => datasetState.contextBitmapCollection.makeKey(l));
                 allSynapseKeys.push(...normalizedLayers);
             }
         }
@@ -1559,7 +1654,7 @@ class SynapsD extends EventEmitter {
         // Directory tree: index document at directory path(s)
         if (directorySpec) {
             const dirs = Array.isArray(directorySpec) ? directorySpec : [directorySpec];
-            const dirKeys = await this.#directoryTree.insertDocumentMany(docId, dirs);
+            const dirKeys = await datasetState.directoryTree.insertDocumentMany(docId, dirs);
             if (dirKeys && dirKeys.length > 0) {
                 allSynapseKeys.push(...dirKeys);
             }
@@ -1567,19 +1662,20 @@ class SynapsD extends EventEmitter {
 
         // Feature bitmaps
         if (featureBitmaps && featureBitmaps.length > 0) {
-            await this.bitmapIndex.tickMany(featureBitmaps, docId);
+            await datasetState.bitmapIndex.tickMany(featureBitmaps, docId);
             allSynapseKeys.push(...featureBitmaps);
         }
 
         // Update Synapses reverse index
         if (allSynapseKeys.length > 0) {
-            await this.#synapses.createSynapses(docId, allSynapseKeys, { syncBitmaps: false });
+            await datasetState.synapses.createSynapses(docId, allSynapseKeys, { syncBitmaps: false });
         }
     }
 
     #buildLegacyFindSpec(contextSpec = null, featureBitmapArray = [], filterArray = [], options = { parse: true }) {
         const allOf = [];
         const noneOf = [];
+        const dataset = options?.dataset;
 
         for (const key of parseBitmapArray(featureBitmapArray).filter(Boolean)) {
             if (key.startsWith('!')) {
@@ -1595,6 +1691,7 @@ class SynapsD extends EventEmitter {
                 allOf,
                 noneOf,
             },
+            dataset,
             filterArray,
             ...options,
         };
@@ -1610,6 +1707,7 @@ class SynapsD extends EventEmitter {
             contextSpec,
             directory = null,
             attributes = null,
+            dataset = 'main',
             filters = null,
             filterArray = [],
             options,
@@ -1629,6 +1727,7 @@ class SynapsD extends EventEmitter {
         return {
             contextSpec: context ?? contextSpec ?? null,
             attributes: this.#normalizeAttributes(attributes),
+            dataset: this.#normalizeDatasetName(dataset),
             filterArray: normalizedFilterArray,
             options: {
                 ...(typeof options === 'object' && options !== null ? options : {}),
@@ -1696,7 +1795,7 @@ class SynapsD extends EventEmitter {
         return normalizedFilters;
     }
 
-    async #buildAttributesBitmap(attributes) {
+    async #buildAttributesBitmap(datasetState, attributes) {
         const normalizedAttributes = this.#normalizeAttributes(attributes);
         if (!normalizedAttributes) {
             return null;
@@ -1710,11 +1809,11 @@ class SynapsD extends EventEmitter {
         let attributeBitmap = null;
 
         if (allOf.length > 0) {
-            attributeBitmap = await this.bitmapIndex.AND(allOf);
+            attributeBitmap = await datasetState.bitmapIndex.AND(allOf);
         }
 
         if (anyOf.length > 0) {
-            const anyBitmap = await this.bitmapIndex.OR(anyOf);
+            const anyBitmap = await datasetState.bitmapIndex.OR(anyOf);
             if (attributeBitmap) {
                 attributeBitmap.andInPlace(anyBitmap);
             } else {
@@ -1724,9 +1823,9 @@ class SynapsD extends EventEmitter {
 
         if (noneOf.length > 0) {
             if (!attributeBitmap) {
-                attributeBitmap = await this.#buildAllDocumentsBitmap();
+                attributeBitmap = await this.#buildAllDocumentsBitmap(datasetState);
             }
-            const noneBitmap = await this.bitmapIndex.OR(noneOf);
+            const noneBitmap = await datasetState.bitmapIndex.OR(noneOf);
             if (noneBitmap && !noneBitmap.isEmpty) {
                 attributeBitmap.andNotInPlace(noneBitmap);
             }
@@ -1735,7 +1834,7 @@ class SynapsD extends EventEmitter {
         return attributeBitmap || new RoaringBitmap32();
     }
 
-    async #buildFeatureBitmap(featureBitmapArray) {
+    async #buildFeatureBitmap(datasetState, featureBitmapArray) {
         const featureKeys = parseBitmapArray(featureBitmapArray).filter(Boolean);
         if (featureKeys.length === 0) {
             return null;
@@ -1746,13 +1845,13 @@ class SynapsD extends EventEmitter {
 
         let featureBitmap = null;
         if (positiveKeys.length > 0) {
-            featureBitmap = await this.bitmapIndex.AND(positiveKeys);
+            featureBitmap = await datasetState.bitmapIndex.AND(positiveKeys);
         } else {
-            featureBitmap = await this.#buildAllDocumentsBitmap();
+            featureBitmap = await this.#buildAllDocumentsBitmap(datasetState);
         }
 
         if (negativeKeys.length > 0 && featureBitmap && !featureBitmap.isEmpty) {
-            const negativeBitmap = await this.bitmapIndex.OR(negativeKeys);
+            const negativeBitmap = await datasetState.bitmapIndex.OR(negativeKeys);
             if (negativeBitmap && !negativeBitmap.isEmpty) {
                 featureBitmap.andNotInPlace(negativeBitmap);
             }
@@ -1761,9 +1860,9 @@ class SynapsD extends EventEmitter {
         return featureBitmap || new RoaringBitmap32();
     }
 
-    async #buildAllDocumentsBitmap() {
+    async #buildAllDocumentsBitmap(datasetState) {
         const ids = [];
-        for await (const { key } of this.documents.getRange()) {
+        for await (const { key } of datasetState.documents.getRange()) {
             const id = Number(key);
             if (Number.isInteger(id) && id > 0) {
                 ids.push(id);
@@ -1776,14 +1875,15 @@ class SynapsD extends EventEmitter {
      * Rebuild feature bitmaps from document data. Scans all documents and ensures
      * each document's schema is indexed in the feature bitmap collection.
      */
-    async reindexFeatures() {
-        if (!this.isRunning()) { throw new Error('Database is not running'); }
+    async reindexFeatures(dataset = 'main') {
+        if (!this.isRunning() && this.#status !== 'initializing') { throw new Error('Database is not running'); }
+        const datasetState = await this.#ensureDatasetState(dataset, false);
         let indexed = 0;
-        for await (const { key, value } of this.documents.getRange()) {
+        for await (const { key, value } of datasetState.documents.getRange()) {
             try {
                 const doc = parseInitializeDocument(value);
                 if (doc.schema) {
-                    await this.bitmapIndex.tick(doc.schema, key);
+                    await datasetState.bitmapIndex.tick(doc.schema, key);
                     indexed++;
                 }
             } catch (e) {
@@ -1792,6 +1892,120 @@ class SynapsD extends EventEmitter {
         }
         debug(`reindexFeatures: Indexed ${indexed} documents`);
         return indexed;
+    }
+
+    async getJsonTreeForDataset(dataset = 'main') {
+        const datasetState = await this.#ensureDatasetState(dataset);
+        return datasetState.tree.buildJsonTree();
+    }
+
+    #normalizeDatasetName(dataset = 'main') {
+        if (typeof dataset !== 'string') { return 'main'; }
+        const normalized = dataset.trim().replace(/^\./, '');
+        return normalized || 'main';
+    }
+
+    #datasetStoreName(baseName, dataset = 'main') {
+        const normalizedDataset = this.#normalizeDatasetName(dataset);
+        return normalizedDataset === 'main' ? baseName : `${baseName}/${normalizedDataset}`;
+    }
+
+    #datasetLancePath(dataset = 'main') {
+        const normalizedDataset = this.#normalizeDatasetName(dataset);
+        return normalizedDataset === 'main'
+            ? path.join(this.#rootPath, 'lance')
+            : path.join(this.#rootPath, 'lance', normalizedDataset);
+    }
+
+    #getOrCreateDatasetState(dataset = 'main') {
+        const normalizedDataset = this.#normalizeDatasetName(dataset);
+        const existingState = this.#datasetStates.get(normalizedDataset);
+        if (existingState) {
+            return existingState;
+        }
+
+        const bitmapCache = new Map();
+        const bitmapStore = this.#db.createDataset(this.#datasetStoreName('bitmaps', normalizedDataset));
+        const bitmapIndex = new BitmapIndex(bitmapStore, bitmapCache);
+        const state = {
+            name: normalizedDataset,
+            documents: this.#db.createDataset(this.#datasetStoreName('documents', normalizedDataset)),
+            metadata: this.#db.createDataset(this.#datasetStoreName('metadata', normalizedDataset)),
+            internalStore: this.#db.createDataset(this.#datasetStoreName('internal', normalizedDataset)),
+            bitmapCache,
+            bitmapStore,
+            bitmapIndex,
+            contextBitmapCollection: bitmapIndex.createCollection('context'),
+            checksumIndex: new ChecksumIndex(this.#db.createDataset(this.#datasetStoreName('checksums', normalizedDataset))),
+            timestampIndex: null,
+            synapses: null,
+            lanceIndex: null,
+            tree: null,
+            directoryTree: new DirectoryTree(bitmapIndex),
+            actionBitmaps: null,
+            deletedDocumentsBitmap: null,
+            runtimeReady: false,
+        };
+
+        state.tree = new ContextTree({
+            dataStore: state.internalStore,
+            db: this,
+        });
+
+        this.#datasetStates.set(normalizedDataset, state);
+        return state;
+    }
+
+    async #ensureDatasetState(dataset = 'main', initializeRuntime = true) {
+        const datasetState = this.#getOrCreateDatasetState(dataset);
+        if (initializeRuntime && this.#status !== 'shutdown' && !datasetState.runtimeReady) {
+            await this.#initializeDatasetRuntime(datasetState);
+        }
+        return datasetState;
+    }
+
+    async #initializeDatasetRuntime(datasetState, options = {}) {
+        if (datasetState.runtimeReady) {
+            return datasetState;
+        }
+
+        datasetState.actionBitmaps = {
+            created: await datasetState.bitmapIndex.createBitmap('internal/action/created'),
+            updated: await datasetState.bitmapIndex.createBitmap('internal/action/updated'),
+            deleted: await datasetState.bitmapIndex.createBitmap('internal/action/deleted'),
+        };
+        datasetState.deletedDocumentsBitmap = await datasetState.bitmapIndex.createBitmap('internal/gc/deleted');
+        datasetState.timestampIndex = new TimestampIndex(
+            datasetState.bitmapIndex,
+            datasetState.actionBitmaps,
+        );
+        datasetState.synapses = new Synapses(
+            this.#db.createDataset(this.#datasetStoreName('synapses', datasetState.name)),
+            datasetState.bitmapIndex,
+        );
+        datasetState.lanceIndex = new LanceIndex({
+            rootPath: this.#datasetLancePath(datasetState.name),
+            bitmapIndex: datasetState.bitmapIndex,
+        });
+        await datasetState.lanceIndex.initialize();
+        await datasetState.lanceIndex.backfill(datasetState.bitmapIndex, datasetState.documents, parseInitializeDocument, 1000);
+        await datasetState.tree.initialize();
+
+        if (datasetState.name === 'main') {
+            this.actionBitmaps = datasetState.actionBitmaps;
+            this.deletedDocumentsBitmap = datasetState.deletedDocumentsBitmap;
+            this.#timestampIndex = datasetState.timestampIndex;
+            this.#synapses = datasetState.synapses;
+            this.#lanceIndex = datasetState.lanceIndex;
+        }
+
+        if (options.migrateLegacyBitmaps && datasetState.name === 'main') {
+            await this.#migrateBitmapKeys();
+        }
+
+        datasetState.runtimeReady = true;
+        await this.reindexFeatures(datasetState.name);
+        return datasetState;
     }
 
     /**
