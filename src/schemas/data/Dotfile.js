@@ -19,7 +19,7 @@
 import Document, { documentSchema } from '../BaseDocument.js';
 import { z } from 'zod';
 
-const DOCUMENT_SCHEMA_NAME = 'data/abstraction/dotfile';
+const DOCUMENT_SCHEMA_NAME = 'data/dotfile';
 const DOCUMENT_SCHEMA_VERSION = '3.0';
 
 // Regex allows:  /abs/path, ~/path, $HOME/path, {{HOME}}/path etc.

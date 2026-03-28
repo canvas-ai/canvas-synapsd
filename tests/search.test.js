@@ -16,7 +16,7 @@ describe('Search', () => {
     describe('Basic search', () => {
         it('queries documents without requiring tree filters', async () => {
             const matchingId = await db.put({
-                schema: 'data/abstraction/note',
+                schema: 'data/note',
                 data: {
                     title: 'Alpha Incident',
                     content: 'GPU driver alpha failure on workstation',
@@ -24,7 +24,7 @@ describe('Search', () => {
             });
 
             await db.put({
-                schema: 'data/abstraction/note',
+                schema: 'data/note',
                 data: {
                     title: 'Beta Incident',
                     content: 'Routine browser tab sync noise',
@@ -42,7 +42,7 @@ describe('Search', () => {
     describe('Incoming exclusion', () => {
         it('excludes incoming-tree memberships from unrestricted listings when requested', async () => {
             const visibleId = await db.put({
-                schema: 'data/abstraction/note',
+                schema: 'data/note',
                 data: {
                     title: 'Visible Result',
                     content: 'This should stay in the normal root view',
@@ -50,7 +50,7 @@ describe('Search', () => {
             }, { tree: 'projects', path: '/visible' });
 
             const hiddenId = await db.put({
-                schema: 'data/abstraction/note',
+                schema: 'data/note',
                 data: {
                     title: 'Incoming Result',
                     content: 'This should stay quarantined',
@@ -67,7 +67,7 @@ describe('Search', () => {
 
         it('excludes incoming-tree memberships from full-text search when requested', async () => {
             await db.put({
-                schema: 'data/abstraction/note',
+                schema: 'data/note',
                 data: {
                     title: 'Visible Search Hit',
                     content: 'searchterm-visible',
@@ -75,7 +75,7 @@ describe('Search', () => {
             }, { tree: 'projects', path: '/search' });
 
             const hiddenId = await db.put({
-                schema: 'data/abstraction/note',
+                schema: 'data/note',
                 data: {
                     title: 'Incoming Search Hit',
                     content: 'searchterm-hidden',

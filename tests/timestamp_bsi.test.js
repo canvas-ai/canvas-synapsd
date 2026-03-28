@@ -19,21 +19,21 @@ describe('Timestamp Index (BSI)', () => {
 
         // Create documents with specific timestamps
         const doc1 = {
-            schema: 'data/abstraction/note',
+            schema: 'data/note',
             data: { title: 'Today Note', content: 'Content 1' },
             createdAt: now.toISOString(),
             updatedAt: now.toISOString(),
         };
 
         const doc2 = {
-            schema: 'data/abstraction/note',
+            schema: 'data/note',
             data: { title: 'Yesterday Note', content: 'Content 2' },
             createdAt: yesterday.toISOString(),
             updatedAt: yesterday.toISOString(),
         };
 
         const doc3 = {
-            schema: 'data/abstraction/note',
+            schema: 'data/note',
             data: { title: 'Last Week Note', content: 'Content 3' },
             createdAt: lastWeek.toISOString(),
             updatedAt: lastWeek.toISOString(),
@@ -70,7 +70,7 @@ describe('Timestamp Index (BSI)', () => {
         // This relies on db.findDocuments parsing "datetime:..." strings
 
         // Insert new docs to be sure
-        const docA = { schema: 'data/abstraction/note', data: { text: 'A', content: 'Content A' }, createdAt: new Date().toISOString() };
+        const docA = { schema: 'data/note', data: { text: 'A', content: 'Content A' }, createdAt: new Date().toISOString() };
         const idA = await db.insertDocument(docA);
 
         // Filter: datetime:created:today
@@ -81,7 +81,7 @@ describe('Timestamp Index (BSI)', () => {
 
     test('should handle find() with timeline filter object', async () => {
         const id = await db.insertDocument({
-            schema: 'data/abstraction/note',
+            schema: 'data/note',
             data: { title: 'Timeline Note', content: 'Timeline content' },
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString(),
@@ -100,7 +100,7 @@ describe('Timestamp Index (BSI)', () => {
 
     test('should handle removal correctly', async () => {
         const doc = {
-            schema: 'data/abstraction/note',
+            schema: 'data/note',
             data: { title: 'To Delete', content: 'Delete me' },
             createdAt: new Date().toISOString()
         };

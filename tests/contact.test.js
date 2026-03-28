@@ -1,4 +1,4 @@
-import Contact from '../src/schemas/abstractions/Contact.js';
+import Contact from '../src/schemas/data/Contact.js';
 
 describe('Contact abstraction', () => {
 

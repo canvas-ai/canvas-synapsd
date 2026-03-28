@@ -1,5 +1,5 @@
 
-import Application from '../src/schemas/abstractions/Application.js';
+import Application from '../src/schemas/data/Application.js';
 
 describe('Application Abstraction', () => {
     it('should create an Application instance for appimage with required source.url', () => {

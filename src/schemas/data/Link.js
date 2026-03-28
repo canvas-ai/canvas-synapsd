@@ -3,7 +3,7 @@
 import Document, { documentSchema as baseDocumentSchema } from '../BaseDocument.js';
 import { z } from 'zod';
 
-const DOCUMENT_SCHEMA_NAME = 'data/abstraction/link';
+const DOCUMENT_SCHEMA_NAME = 'data/link';
 const DOCUMENT_SCHEMA_VERSION = '1.0';
 const URI_SCHEME_REGEX = /^[a-zA-Z][a-zA-Z0-9+.-]*:/;
 

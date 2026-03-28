@@ -4,18 +4,19 @@
 import BaseDocument from './BaseDocument.js';
 
 // Document Schemas
-import Document from './abstractions/Document.js';
-import Contact from './abstractions/Contact.js';
-import Email from './abstractions/Email.js';
-import File from './abstractions/File.js';
-import Folder from './abstractions/Folder.js';
-import Link from './abstractions/Link.js';
-import Note from './abstractions/Note.js';
-import Tab from './abstractions/Tab.js';
-import Todo from './abstractions/Todo.js';
-import Dotfile from './abstractions/Dotfile.js';
-import Device from './abstractions/Device.js';
-import Application from './abstractions/Application.js';
+import Document from './data/Document.js';
+import Application from './data/Application.js';
+import Contact from './data/Contact.js';
+import Device from './data/Device.js';
+import Dotfile from './data/Dotfile.js';
+import Email from './data/Email.js';
+import File from './data/File.js';
+import Folder from './data/Folder.js';
+import Link from './data/Link.js';
+import Message from './data/Message.js';
+import Note from './data/Note.js';
+import Todo from './data/Todo.js';
+import Website from './data/Website.js';
 
 // Tree Abstractions
 import Canvas from './internal/layers/Canvas.js';
@@ -27,21 +28,20 @@ import Workspace from './internal/layers/Workspace.js';
 
 // Default schema registry (for now hard-coded)
 const SCHEMA_REGISTRY = {
-    // Data Abstractions
-    'data/abstraction/document': Document,
-    // Back-compat aliases used in tests and older code
-    'BaseDocument': Document,
-    'data/abstraction/contact': Contact,
-    'data/abstraction/email': Email,
-    'data/abstraction/file': File,
-    'data/abstraction/folder': Folder,
-    'data/abstraction/link': Link,
-    'data/abstraction/note': Note,
-    'data/abstraction/tab': Tab,
-    'data/abstraction/todo': Todo,
-    'data/abstraction/dotfile': Dotfile,
-    'data/abstraction/device': Device,
-    'data/abstraction/application': Application,
+    // Data schemas
+    'data/document': Document,
+    'data/application': Application,
+    'data/contact': Contact,
+    'data/device': Device,
+    'data/dotfile': Dotfile,
+    'data/email': Email,
+    'data/file': File,
+    'data/folder': Folder,
+    'data/link': Link,
+    'data/message': Message,
+    'data/note': Note,
+    'data/todo': Todo,
+    'data/website': Website,
 
     // Tree Abstractions
     'internal/layers/canvas': Canvas,           // Can store context, feature and filter bitmaps + dashboard / UI layouts

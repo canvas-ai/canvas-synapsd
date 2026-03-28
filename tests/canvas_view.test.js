@@ -16,17 +16,17 @@ describe('Canvas views (as layers)', () => {
 
         await db.createCanvas(canvasPath, {
             view: {
-                features: ['data/abstraction/note'],
+                features: ['data/note'],
             },
             acl: { owner: 'canvas-app', access: 'rw' },
         });
 
         const noteId = await db.insertDocument(
-            { schema: 'data/abstraction/note', data: { title: 'N', content: 'C' } },
+            { schema: 'data/note', data: { title: 'N', content: 'C' } },
             canvasPath
         );
         const tabId = await db.insertDocument(
-            { schema: 'data/abstraction/tab', data: { title: 'T', url: 'https://example.com' } },
+            { schema: 'data/website', data: { title: 'T', url: 'https://example.com' } },
             canvasPath
         );
 
@@ -36,7 +36,7 @@ describe('Canvas views (as layers)', () => {
         expect(ids).not.toContain(tabId);
 
         // Expand feature set to include tabs too
-        await db.updateCanvas(canvasPath, { view: { features: ['data/abstraction/note', 'data/abstraction/tab'] } });
+        await db.updateCanvas(canvasPath, { view: { features: ['data/note', 'data/website'] } });
         const notesAndTabs = await db.queryCanvas(canvasPath);
         const ids2 = notesAndTabs.map(d => d.id);
         expect(ids2).toContain(noteId);
@@ -44,7 +44,7 @@ describe('Canvas views (as layers)', () => {
 
         const canvasLayer = db.getCanvas(canvasPath);
         expect(canvasLayer.type).toBe('canvas');
-        expect(canvasLayer.metadata?.view?.features).toContain('data/abstraction/note');
+        expect(canvasLayer.metadata?.view?.features).toContain('data/note');
         expect(canvasLayer.acl).toEqual({ owner: 'canvas-app', access: 'rw' });
     });
 

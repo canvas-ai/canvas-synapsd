@@ -1,4 +1,4 @@
-import Link from '../src/schemas/abstractions/Link.js';
+import Link from '../src/schemas/data/Link.js';
 
 describe('Link abstraction', () => {
 
