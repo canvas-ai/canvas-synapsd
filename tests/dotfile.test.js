@@ -1,5 +1,5 @@
 
-import Dotfile from '../src/schemas/abstractions/Dotfile.js';
+import Dotfile from '../src/schemas/data/Dotfile.js';
 
 describe('Dotfile Abstraction', () => {
     const validData = {

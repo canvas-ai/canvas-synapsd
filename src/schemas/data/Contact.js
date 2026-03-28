@@ -3,7 +3,7 @@
 import Document, { documentSchema as baseDocumentSchema } from '../BaseDocument.js';
 import { z } from 'zod';
 
-const DOCUMENT_SCHEMA_NAME = 'data/abstraction/contact';
+const DOCUMENT_SCHEMA_NAME = 'data/contact';
 const DOCUMENT_SCHEMA_VERSION = '1.0';
 
 const identitySchema = z.object({

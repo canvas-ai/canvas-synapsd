@@ -3,7 +3,7 @@
 import BaseDocument, { documentSchema as baseDocumentSchema } from '../BaseDocument.js';
 import { z } from 'zod';
 
-const DOCUMENT_SCHEMA_NAME = 'data/abstraction/file';
+const DOCUMENT_SCHEMA_NAME = 'data/file';
 const DOCUMENT_SCHEMA_VERSION = '2.3';
 
 // File-specific data schema

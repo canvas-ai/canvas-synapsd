@@ -3,13 +3,13 @@
 import Document, { documentSchema as baseDocumentSchema } from '../BaseDocument.js';
 import { z } from 'zod';
 
-const DOCUMENT_SCHEMA_NAME = 'data/abstraction/email';
+const DOCUMENT_SCHEMA_NAME = 'data/email';
 const DOCUMENT_SCHEMA_VERSION = '3.0';
 const EMAIL_FEATURE_BITMAPS = {
-    sent: 'data/abstraction/email/sent',
-    received: 'data/abstraction/email/received',
-    attachment: 'data/abstraction/email/attachment',
-    flagged: 'data/abstraction/email/flagged',
+    sent: 'data/email/sent',
+    received: 'data/email/received',
+    attachment: 'data/email/attachment',
+    flagged: 'data/email/flagged',
 };
 const DEFAULT_EMAIL_SUBJECT = '(no subject)';
 

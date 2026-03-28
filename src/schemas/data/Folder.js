@@ -3,7 +3,7 @@
 import BaseDocument, { documentSchema as baseDocumentSchema } from '../BaseDocument.js';
 import { z } from 'zod';
 
-const DOCUMENT_SCHEMA_NAME = 'data/abstraction/folder';
+const DOCUMENT_SCHEMA_NAME = 'data/folder';
 const DOCUMENT_SCHEMA_VERSION = '1.0';
 
 const folderDataSchema = BaseDocument.extendDataSchema(

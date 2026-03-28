@@ -20,7 +20,7 @@
 import Document, { documentSchema } from '../BaseDocument.js';
 import { z } from 'zod';
 
-const DOCUMENT_SCHEMA_NAME = 'data/abstraction/application';
+const DOCUMENT_SCHEMA_NAME = 'data/application';
 const DOCUMENT_SCHEMA_VERSION = '1.0';
 
 const applicationTypeSchema = z.enum(['appimage', 'flatpak', 'snap', 'portable', 'system', 'local']);

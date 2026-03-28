@@ -3,53 +3,43 @@
 import Document, { documentSchema } from '../BaseDocument.js';
 import { z } from 'zod';
 
-const DOCUMENT_SCHEMA_NAME = 'data/abstraction/note';
-const DOCUMENT_SCHEMA_VERSION = '2.0';
+const DOCUMENT_SCHEMA_NAME = 'data/device';
+const DOCUMENT_SCHEMA_VERSION = '1.1';
 
 const documentDataSchema = z.object({
     schema: z.string(),
     schemaVersion: z.string().optional(),
     data: z.object({
-        title: z.string().optional(),
-        content: z.string(),
+        deviceId: z.string().min(1),
+        name: z.string().min(1),
+        description: z.string().optional(),
+        platform: z.string().optional(),
+        arch: z.string().optional(),
+        type: z.string().optional(),
+        createdAt: z.string().optional(),
+        lastSeen: z.string().optional(),
     }).passthrough(),
     metadata: z.object().optional(),
 });
 
-export default class Note extends Document {
+export default class Device extends Document {
     constructor(options = {}) {
-        // Set schema before calling super
         options.schema = options.schema || DOCUMENT_SCHEMA_NAME;
         options.schemaVersion = options.schemaVersion || DOCUMENT_SCHEMA_VERSION;
 
-        // Inject Note-specific index options BEFORE super()
         options.indexOptions = {
             ...(options.indexOptions || {}),
-            ftsSearchFields: ['data.title', 'data.content'],
-            vectorEmbeddingFields: ['data.title', 'data.content'],
-            checksumFields: ['data.title', 'data.content'],
+            ftsSearchFields: ['data.name', 'data.deviceId', 'data.description'],
+            vectorEmbeddingFields: ['data.name'],
+            checksumFields: ['data.deviceId'],
         };
 
         super(options);
-
-        if (!this.data.title) {
-            // If Note has no title, we'll use YYYYMMDD, subject to change
-            const now = new Date();
-            const year = now.getFullYear();
-            const month = (now.getMonth() + 1).toString().padStart(2, '0');
-            const day = now.getDate().toString().padStart(2, '0');
-            this.data.title = `${year}${month}${day}`;
-        }
     }
 
-    /**
-     * Create a Note from minimal data
-     * @param {Object} data - Note data
-     * @returns {Note} New Note instance
-     */
     static fromData(data) {
         data.schema = DOCUMENT_SCHEMA_NAME;
-        return new Note(data);
+        return new Device(data);
     }
 
     static get dataSchema() {
@@ -64,8 +54,14 @@ export default class Note extends Document {
         return {
             schema: DOCUMENT_SCHEMA_NAME,
             data: {
-                title: 'string',
-                content: 'string',
+                deviceId: 'string',
+                name: 'string',
+                description: 'string',
+                platform: 'string',
+                arch: 'string',
+                type: 'string',
+                createdAt: 'string',
+                lastSeen: 'string',
             },
         };
     }
@@ -78,3 +74,4 @@ export default class Note extends Document {
         return documentDataSchema.parse(documentData);
     }
 }
+
